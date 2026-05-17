@@ -6,6 +6,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Low-battery LED keeps blinking after controller disconnect** (`fb68ea5`). When the DualSense's battery dropped low enough to trigger `battery_led_tick`'s blink and the controller subsequently disconnected (typically: battery fully depletes and the BT link drops), the Pico's onboard LED stayed frozen in whichever half-cycle it was in at the moment of disconnect; reconnect-retry windows could even briefly resume blinking. New `battery_led_on_disconnect()` clears blink state, forces LED off, and zeros `last_report_us` so the stale-check early-return blocks any new blink until a fresh 0x31 report arrives on the next connection. Stale-check in the tick also now forces LED off when it fires mid-blink (defense in depth for ungraceful disconnects). Reported by Sura Academy on Discord. Same bug present in upstream — sent back as [awalol/DS5Dongle#101](https://github.com/awalol/DS5Dongle/pull/101).
+
+---
+
+## [0.6.0-oled-edition] — 2026-05-17
+
+Tagged release of the rebase below. UF2s attached to [the GitHub release](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.6.0-oled-edition) (built by `.github/workflows/release.yml`). No code changes vs the rebase; tag exists so users can install from a stable artifact.
+
+---
+
 ## [0.6.0-rebase] — 2026-05-17
 
 Rebased onto upstream `awalol/DS5Dongle` `v0.6.0-hotfix`. All OLED Edition features preserved with no user-visible regression.
