@@ -104,11 +104,29 @@ jobs:
           cmake --build build/debug --target ds5-bridge
           cp build/debug/ds5-bridge-oled.uf2 "artifacts/ds5-bridge-oled-debug-${{ github.event.release.tag_name }}.uf2"
 
-      - name: Upload UF2 files to release
+      - name: Compute UF2 checksums + append to release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # Generate SHA256SUMS.txt next to the UF2s
+          ( cd artifacts && sha256sum *.uf2 > SHA256SUMS.txt )
+          cat artifacts/SHA256SUMS.txt
+          # Append the same hashes (markdown-formatted) to the existing release body
+          BODY=$(gh release view "$TAG" --json body --jq .body)
+          {
+            printf '%s\n' "$BODY"
+            printf '\n---\n\n## Checksums\n\n```\n'
+            cat artifacts/SHA256SUMS.txt
+            printf '```\n'
+          } > /tmp/release-notes.md
+          gh release edit "$TAG" --notes-file /tmp/release-notes.md
+
+      - name: Upload UF2 files + SHA256SUMS to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" artifacts/*.uf2 --clobber
+          gh release upload "${{ github.event.release.tag_name }}" artifacts/*.uf2 artifacts/SHA256SUMS.txt --clobber
 
       # Notify the web config repo so its GH Pages deploy rebuilds and
       # bundles this fresh UF2 into the site. If the WEB_REPO_DISPATCH_PAT
