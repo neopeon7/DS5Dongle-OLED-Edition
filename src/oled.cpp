@@ -42,14 +42,20 @@ uint32_t key0_t_us = 0;
 uint32_t key1_t_us = 0;
 constexpr uint32_t kDebounceUs = 20000;
 
-uint32_t key0_first_press_us = 0;
-bool key0_pending_single = false;
-constexpr uint32_t kDoubleClickUs = 400000;
+// Single-press latch — armed on rising edge, fired on release. KEY0 was
+// previously a double-click reboot trigger; that gesture moved to the
+// KEY0+KEY1 chord below because rapid forward-navigation kept tripping it.
+bool key0_armed = false;
 
 // KEY1 long-press detection (for brightness cycling)
 uint32_t key1_press_us = 0;
 bool key1_was_pressed = false;
 constexpr uint32_t kLongPressUs = 1500000;
+
+// KEY0 + KEY1 simultaneous hold → watchdog_reboot. 1 s hold is long enough
+// to filter accidental two-button taps but short enough to feel responsive.
+uint32_t chord_held_since_us = 0;
+constexpr uint32_t kChordHoldUs = 1000000;
 
 // Brightness levels (SH1107 contrast register 0x81). User cycles via KEY1 long-press.
 constexpr uint8_t kBrightLevels[] = {0xFF, 0x7F, 0x3F, 0x10};
@@ -119,6 +125,13 @@ constexpr uint32_t kRumbleBurstUs = 250000;
 
 int trigger_preset = 0;
 const char* const kTrigPresetNames[] = {"Off", "Feedback", "Weapon", "Vibration", "Bow", "Gallop", "Machine"};
+
+// Rising-edge trackers for the screens whose K1=cycle action moved to a
+// controller button. Trigger Test uses △ (byte 7 bit 7); Lightbar uses R1
+// (byte 8 bit 1) because △ is already taken on Lightbar for "save current
+// RGB to favorite slot 0".
+uint8_t triggers_last_face = 0;
+uint8_t lb_last_buttons = 0;
 constexpr int kNumTrigPresets = 7;
 
 void cmd(uint8_t c) {
@@ -175,7 +188,13 @@ void sh1107_init() {
     cmd(0xAF);
 }
 
+// Forward-declared so flush_fb can paint the per-button arrows on top of
+// the rendered framebuffer just before SPI sends it to the OLED. Body
+// lives near the other text-drawing helpers below.
+void draw_button_chrome();
+
 void flush_fb() {
+    draw_button_chrome();
     cmd(0xB0);
     for (int j = 0; j < kH; j++) {
         const uint8_t col = kH - 1 - j;
@@ -223,6 +242,17 @@ void draw_text(int x, int y, const char *s) {
         draw_char(x, y, *s++);
         x += 6;
     }
+}
+
+// Button-chrome strip on the left edge of every screen. KEY0 (top button)
+// shows '>' at y=8; KEY1 (bottom button) shows '<' at y=49. Painted by
+// flush_fb() on top of the rendered framebuffer so it never gets clobbered.
+// Per-screen renderers reserve x ∈ [0..5] (5-wide glyph + 1 padding) and
+// start main content at kContentX.
+constexpr int kContentX = 6;
+void draw_button_chrome() {
+    draw_char(0, 8,  '>');
+    draw_char(0, 49, '<');
 }
 
 // Pixel-art icon support. Visual approach inspired by zurce/DS5Dongle-OLED
@@ -387,22 +417,41 @@ void handle_buttons() {
     const uint32_t now = time_us_32();
     const bool k0 = gpio_get(kPinKey0);
     const bool k1 = gpio_get(kPinKey1);
+
+    // KEY0 + KEY1 chord — both held >= kChordHoldUs triggers watchdog_reboot.
+    // Pre-empts the per-key handlers so a chord cancels any armed single
+    // press (whichever key gets released first won't also navigate).
+    const bool chord = !k0 && !k1;
+    if (chord) {
+        if (chord_held_since_us == 0) chord_held_since_us = now;
+        key0_armed = false;
+        key1_was_pressed = false;
+        if ((now - chord_held_since_us) >= kChordHoldUs) {
+            watchdog_reboot(0, 0, 0);
+        }
+    } else {
+        chord_held_since_us = 0;
+    }
+
+    // KEY0: arm on debounced rising edge, fire "next screen" on release.
+    // Releasing without a chord during the hold = pure forward-nav.
     if (!k0 && key0_prev && (now - key0_t_us) > kDebounceUs) {
         key0_t_us = now;
-        if (key0_pending_single && (now - key0_first_press_us) < kDoubleClickUs) {
-            key0_pending_single = false;
-            watchdog_reboot(0, 0, 0);
-        } else {
-            key0_pending_single = true;
-            key0_first_press_us = now;
-        }
+        key0_armed = true;
+        last_activity_us = now;
     }
-    if (key0_pending_single && (now - key0_first_press_us) > kDoubleClickUs) {
-        key0_pending_single = false;
+    if (k0 && !key0_prev && key0_armed) {
+        key0_armed = false;
         current_screen = (current_screen + 1) % kNumScreens;
         last_render_us = 0;
+        last_activity_us = now;
     }
-    // KEY1: track press time, decide on release whether it was short or long
+
+    // KEY1: arm on press, fire on release. Short press = back; long press
+    // = brightness cycle (unchanged). Trigger-preset / lightbar-mode cycle
+    // moved to the DualSense △ button — see triggers_handle_input() and
+    // lightbar_handle_input(). The chord above clears key1_was_pressed so
+    // a released-after-chord K1 doesn't navigate back.
     if (!k1 && key1_prev && (now - key1_t_us) > kDebounceUs) {
         key1_t_us = now;
         key1_press_us = now;
@@ -414,24 +463,13 @@ void handle_buttons() {
         const uint32_t held = now - key1_press_us;
         last_activity_us = now;
         if (held > kLongPressUs) {
-            // Long press: cycle brightness level
             bright_idx = (bright_idx + 1) % kNumBrightLevels;
         } else {
-            // Short press: contextual per screen. On Trigger Test / Lightbar
-            // KEY1 stays as the primary in-screen cycle. Everywhere else it
-            // acts as a "back" button — cycles to the previous screen so
-            // KEY0/KEY1 form a natural forward/back pair.
-            if (current_screen == kScreenTriggers) {
-                trigger_preset = (trigger_preset + 1) % kNumTrigPresets;
-                send_trigger_effect(trigger_preset);
-            } else if (current_screen == kScreenLightbar) {
-                lb_mode = (lb_mode + 1) % kNumLbModes;
-            } else {
-                current_screen = (current_screen - 1 + kNumScreens) % kNumScreens;
-                last_render_us = 0;
-            }
+            current_screen = (current_screen - 1 + kNumScreens) % kNumScreens;
+            last_render_us = 0;
         }
     }
+
     key0_prev = k0;
     key1_prev = k1;
 }
@@ -441,7 +479,7 @@ __attribute__((noinline)) void render_screen() {
 
     const bool connected = bt_is_connected();
 
-    draw_text(0, 0, "DS5 Bridge v0.6.0");
+    draw_text(kContentX, 0, "DS5 Bridge v0.6.0");
     draw_icon(120, 0, connected ? kIconLinkOn : kIconLinkOff, 8, 8);
 
     if (connected) {
@@ -450,7 +488,7 @@ __attribute__((noinline)) void render_screen() {
         char buf[24];
         snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
                  a[0], a[1], a[2], a[3], a[4], a[5]);
-        draw_text(0, 9, buf);
+        draw_text(kContentX, 9, buf);
 
         const uint8_t pwr = interrupt_in_data[52];
         int pct = (pwr & 0x0F) * 10;
@@ -462,11 +500,13 @@ __attribute__((noinline)) void render_screen() {
         else if (pstate >= 0xA) marker = '!'; // Error
         char bbuf[16];
         snprintf(bbuf, sizeof(bbuf), "%3d%%%c", pct, marker);
-        draw_text(0, 18, bbuf);
-        draw_battery_icon(30, 18, pct);
+        draw_text(kContentX, 18, bbuf);
+        draw_battery_icon(36, 18, pct);
 
-        rect_outline(0, 30, 32, 32);
-        int lx = 2 + (interrupt_in_data[0] * 27) / 255;
+        // Left-half visuals are shifted right by kContentX so the < button
+        // chrome at (x=0, y=49) doesn't paint over the live stick dot.
+        rect_outline(kContentX, 30, 32, 32);
+        int lx = (kContentX + 2) + (interrupt_in_data[0] * 27) / 255;
         int ly = 32 + (interrupt_in_data[1] * 27) / 255;
         rect_filled(lx - 1, ly - 1, 3, 3);
 
@@ -475,10 +515,11 @@ __attribute__((noinline)) void render_screen() {
         int ry = 32 + (interrupt_in_data[3] * 27) / 255;
         rect_filled(rx - 1, ry - 1, 3, 3);
 
-        // L2/R2 analog trigger bars (vertical, fill from bottom)
-        rect_outline(32, 33, 4, 29);
+        // L2/R2 analog trigger bars (vertical, fill from bottom). L2 sits
+        // just right of the shifted left stick box.
+        rect_outline(kContentX + 32, 33, 4, 29);
         const int l2_fill = (interrupt_in_data[4] * 27) / 255;
-        if (l2_fill > 0) rect_filled(33, 61 - l2_fill, 2, l2_fill);
+        if (l2_fill > 0) rect_filled(kContentX + 33, 61 - l2_fill, 2, l2_fill);
         rect_outline(92, 33, 4, 29);
         const int r2_fill = (interrupt_in_data[5] * 27) / 255;
         if (r2_fill > 0) rect_filled(93, 61 - r2_fill, 2, r2_fill);
@@ -486,13 +527,14 @@ __attribute__((noinline)) void render_screen() {
         const uint8_t b7 = interrupt_in_data[7];
         const uint8_t b8 = interrupt_in_data[8];
 
-        // D-pad indicator (4 directions; lit for primary + diagonals)
+        // D-pad indicator (4 directions; lit for primary + diagonals).
+        // Centered between the left stick column and the face-button cluster.
         const int dp = b7 & 0x0F;
         const bool dp_n = (dp == 7 || dp == 0 || dp == 1);
         const bool dp_e = (dp == 1 || dp == 2 || dp == 3);
         const bool dp_s = (dp == 3 || dp == 4 || dp == 5);
         const bool dp_w = (dp == 5 || dp == 6 || dp == 7);
-        const int dcx = 46, dcy = 46;
+        const int dcx = 52, dcy = 46;
         auto dot = [&](int dx, int dy, bool on) {
             if (on) rect_filled(dcx + dx - 2, dcy + dy - 2, 5, 5);
             else    rect_outline(dcx + dx - 2, dcy + dy - 2, 5, 5);
@@ -514,13 +556,14 @@ __attribute__((noinline)) void render_screen() {
         sq(fcx_off + 0,   8, b7 & 0x20); // Cross
         sq(fcx_off - 8,   0, b7 & 0x10); // Square
 
-        if (b8 & 0x01) rect_filled(36, 30, 12, 3); else rect_outline(36, 30, 12, 3); // L1
+        // L1 bar shifted to sit between the L2 trigger column and the d-pad.
+        if (b8 & 0x01) rect_filled(42, 30, 8, 3);  else rect_outline(42, 30, 8, 3);  // L1
         if (b8 & 0x02) rect_filled(80, 30, 12, 3); else rect_outline(80, 30, 12, 3); // R1
     } else {
-        draw_text(0, 14, "Pair your DualSense:");
-        draw_text(0, 26, "1. Hold Create + PS");
-        draw_text(0, 36, "2. Wait for light bar");
-        draw_text(0, 46, "   to flash blue");
+        draw_text(kContentX, 14, "Pair your DualSense:");
+        draw_text(kContentX, 26, "1. Hold Create + PS");
+        draw_text(kContentX, 36, "2. Wait for light bar");
+        draw_text(kContentX, 46, "   to flash blue");
     }
 
     flush_fb();
@@ -528,41 +571,40 @@ __attribute__((noinline)) void render_screen() {
 
 __attribute__((noinline)) void render_screen_rssi() {
     fb_clear();
-    draw_text(0, 0, "BT Signal");
+    draw_text(kContentX, 0, "BT Signal");
     if (bt_is_connected()) {
         int8_t rssi = 0;
         bt_get_signal_strength(&rssi);
         char buf[24];
         snprintf(buf, sizeof(buf), "RSSI: %d dBm", (int)rssi);
-        draw_text(0, 12, buf);
+        draw_text(kContentX, 12, buf);
 
         // Map RSSI range -90..-40 dBm to 0..100% bar
         int pct = ((int)rssi + 90) * 100 / 50;
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100;
         snprintf(buf, sizeof(buf), "Quality: %d%%", pct);
-        draw_text(0, 22, buf);
-        rect_outline(0, 34, 128, 10);
-        int fill = (pct * 124) / 100;
-        if (fill > 0) rect_filled(2, 36, fill, 6);
+        draw_text(kContentX, 22, buf);
+        rect_outline(kContentX, 34, 122, 10);
+        int fill = (pct * 118) / 100;
+        if (fill > 0) rect_filled(kContentX + 2, 36, fill, 6);
 
         const char *label = "Poor";
         if (rssi > -55) label = "Excellent";
         else if (rssi > -65) label = "Good";
         else if (rssi > -75) label = "Fair";
         snprintf(buf, sizeof(buf), "Link: %s", label);
-        draw_text(0, 48, buf);
+        draw_text(kContentX, 48, buf);
     } else {
-        draw_text(0, 30, "(no controller)");
+        draw_text(kContentX, 30, "(no controller)");
     }
-    draw_text(0, 56, "K0=next");
     flush_fb();
 }
 
 __attribute__((noinline)) void render_screen_diag() {
     fb_clear();
 
-    draw_text(0, 0, "Diagnostics");
+    draw_text(kContentX, 0, "Diagnostics");
 
     const uint32_t uptime_s = time_us_32() / 1000000u;
     const uint32_t h = uptime_s / 3600u;
@@ -570,7 +612,7 @@ __attribute__((noinline)) void render_screen_diag() {
     const uint32_t s = uptime_s % 60u;
     char buf[24];
     snprintf(buf, sizeof(buf), "Up:%luh %02lum %02lus", (unsigned long)h, (unsigned long)m, (unsigned long)s);
-    draw_text(0, 9, buf);
+    draw_text(kContentX, 9, buf);
 
     // Per-second rates for the audio path counters — recompute every render.
     static uint32_t prev_us_frames = 0, prev_bt_packets = 0;
@@ -591,23 +633,21 @@ __attribute__((noinline)) void render_screen_diag() {
     prev_sample_us = now_us;
 
     snprintf(buf, sizeof(buf), "USB aud %lu/s", (unsigned long)usb_rate);
-    draw_text(0, 18, buf);
+    draw_text(kContentX, 18, buf);
     snprintf(buf, sizeof(buf), "BT 0x32 %lu/s", (unsigned long)bt_rate);
-    draw_text(0, 27, buf);
+    draw_text(kContentX, 27, buf);
     snprintf(buf, sizeof(buf), "HCI errs:  %lu", (unsigned long)bt_hci_err_count());
-    draw_text(0, 36, buf);
+    draw_text(kContentX, 36, buf);
 
     snprintf(buf, sizeof(buf), "BT: %s", bt_is_connected() ? "connected" : "waiting");
-    draw_text(0, 45, buf);
-
-    draw_text(0, 56, "K0=next K1=back");
+    draw_text(kContentX, 45, buf);
 
     flush_fb();
 }
 
 __attribute__((noinline)) void render_screen_cpu(bool entered) {
     fb_clear();
-    draw_text(0, 0, "CPU / Clock");
+    draw_text(kContentX, 0, "CPU / Clock");
 
     char buf[24];
 
@@ -615,7 +655,7 @@ __attribute__((noinline)) void render_screen_cpu(bool entered) {
     // via set_sys_clock_khz(). This is the *target*.
     const uint32_t set_khz = (uint32_t)SYS_CLOCK_KHZ;
     snprintf(buf, sizeof(buf), "Set : %lu MHz", (unsigned long)(set_khz / 1000u));
-    draw_text(0, 12, buf);
+    draw_text(kContentX, 12, buf);
 
     // Actually running clk_sys, measured by the on-chip frequency counter
     // against the crystal reference (not just what we asked for). The counter
@@ -631,7 +671,7 @@ __attribute__((noinline)) void render_screen_cpu(bool entered) {
     snprintf(buf, sizeof(buf), "Real: %lu.%01lu MHz",
              (unsigned long)(real_khz / 1000u),
              (unsigned long)((real_khz % 1000u) / 100u));
-    draw_text(0, 22, buf);
+    draw_text(kContentX, 22, buf);
 
     // Core voltage actually programmed into the regulator, read back (not the
     // compile-time constant). Codes 0..15 are linear 0.05 V steps from 0.55 V.
@@ -642,7 +682,7 @@ __attribute__((noinline)) void render_screen_cpu(bool entered) {
     } else {
         snprintf(buf, sizeof(buf), "Vcore: code %d", vcode);
     }
-    draw_text(0, 32, buf);
+    draw_text(kContentX, 32, buf);
 
     // RP2350 on-die temperature sensor. Smoothed + averaged in cmd.cpp
     // (single source of truth shared with the 0xfc web telemetry) so the
@@ -653,52 +693,67 @@ __attribute__((noinline)) void render_screen_cpu(bool entered) {
     const int t10 = (int)(temp_c * 10.0f + (temp_c >= 0 ? 0.5f : -0.5f));
     snprintf(buf, sizeof(buf), "Temp : %d.%d C", t10 / 10,
              (t10 < 0 ? -t10 : t10) % 10);
-    draw_text(0, 42, buf);
+    draw_text(kContentX, 42, buf);
 
-    draw_text(0, 56, "K0=next K1=back");
     flush_fb();
 }
 
+// △ rising edge on the Trigger Test screen cycles trigger_preset and
+// re-applies the new effect to the paired controller. KEY1 used to do
+// this; moving it to the controller frees K0/K1 for navigation only.
+void triggers_handle_input() {
+    if (!bt_is_connected()) { triggers_last_face = 0; return; }
+    const uint8_t face = interrupt_in_data[7] & 0xF0;
+    const bool tri_now  = (face & 0x80) != 0;
+    const bool tri_prev = (triggers_last_face & 0x80) != 0;
+    if (tri_now && !tri_prev) {
+        trigger_preset = (trigger_preset + 1) % kNumTrigPresets;
+        send_trigger_effect(trigger_preset);
+    }
+    triggers_last_face = face;
+}
+
 __attribute__((noinline)) void render_screen_triggers() {
+    triggers_handle_input();
     fb_clear();
-    draw_text(0, 0, "Trigger Test");
+    draw_text(kContentX, 0, "Trigger Test");
 
     char buf[24];
     snprintf(buf, sizeof(buf), "Mode: %s", kTrigPresetNames[trigger_preset]);
-    draw_text(0, 12, buf);
+    draw_text(kContentX, 12, buf);
 
     if (bt_is_connected()) {
         const uint8_t l2 = interrupt_in_data[4];
         const uint8_t r2 = interrupt_in_data[5];
         snprintf(buf, sizeof(buf), "L2:%3d  R2:%3d", l2, r2);
-        draw_text(0, 24, buf);
+        draw_text(kContentX, 24, buf);
 
-        rect_outline(0, 35, 60, 9);
-        int lfill = (l2 * 56) / 255;
-        if (lfill > 0) rect_filled(2, 37, lfill, 5);
-        rect_outline(68, 35, 60, 9);
-        int rfill = (r2 * 56) / 255;
-        if (rfill > 0) rect_filled(70, 37, rfill, 5);
+        rect_outline(kContentX, 35, 56, 9);
+        int lfill = (l2 * 52) / 255;
+        if (lfill > 0) rect_filled(kContentX + 2, 37, lfill, 5);
+        rect_outline(72, 35, 56, 9);
+        int rfill = (r2 * 52) / 255;
+        if (rfill > 0) rect_filled(74, 37, rfill, 5);
     } else {
-        draw_text(0, 24, "(no controller)");
+        draw_text(kContentX, 24, "(no controller)");
     }
 
-    draw_text(0, 56, "K0=next K1=cycle");
+    draw_text(kContentX, 56, "Tri=cycle");
     flush_fb();
 }
 
 __attribute__((noinline)) void render_screen_gyro() {
     fb_clear();
-    draw_text(0, 0, "Gyro Tilt");
+    draw_text(kContentX, 0, "Gyro Tilt");
     if (bt_is_connected()) {
         int16_t ax, ay, az;
         memcpy(&ax, &interrupt_in_data[21], 2);
         memcpy(&ay, &interrupt_in_data[23], 2);
         memcpy(&az, &interrupt_in_data[25], 2);
         char buf[16];
-        snprintf(buf, sizeof(buf), "X%+5d", ax); draw_text(0,  10, buf);
-        snprintf(buf, sizeof(buf), "Y%+5d", ay); draw_text(44, 10, buf);
-        snprintf(buf, sizeof(buf), "Z%+5d", az); draw_text(88, 10, buf);
+        snprintf(buf, sizeof(buf), "X%+5d", ax); draw_text(kContentX, 10, buf);
+        snprintf(buf, sizeof(buf), "Y%+5d", ay); draw_text(50, 10, buf);
+        snprintf(buf, sizeof(buf), "Z%+5d", az); draw_text(94, 10, buf);
 
         const int bx = 44, by = 22, bw = 40, bh = 40;
         rect_outline(bx, by, bw, bh);
@@ -714,16 +769,16 @@ __attribute__((noinline)) void render_screen_gyro() {
         if (cy > by + bh - 3) cy = by + bh - 3;
         rect_filled(cx - 1, cy - 1, 3, 3);
     } else {
-        draw_text(0, 30, "(no controller)");
+        draw_text(kContentX, 30, "(no controller)");
     }
     flush_fb();
 }
 
 __attribute__((noinline)) void render_screen_touchpad() {
     fb_clear();
-    draw_text(0, 0, "Touchpad");
+    draw_text(kContentX, 0, "Touchpad");
     if (bt_is_connected()) {
-        rect_outline(4, 12, 120, 30);
+        rect_outline(kContentX + 2, 12, 116, 30);
         int active = 0;
         for (int finger = 0; finger < 2; finger++) {
             const int off = 32 + finger * 4;
@@ -735,9 +790,9 @@ __attribute__((noinline)) void render_screen_touchpad() {
             if (not_touching) continue;
             const uint16_t fx = (f >> 8) & 0xFFFu;
             const uint16_t fy = (f >> 20) & 0xFFFu;
-            int sx = 5 + ((int)fx * 114) / 1919;
+            int sx = (kContentX + 3) + ((int)fx * 110) / 1919;
             int sy = 13 + ((int)fy * 26) / 1079;
-            if (sx < 5)   sx = 5;
+            if (sx < kContentX + 3)   sx = kContentX + 3;
             if (sx > 122) sx = 122;
             if (sy < 13)  sy = 13;
             if (sy > 40)  sy = 40;
@@ -746,11 +801,10 @@ __attribute__((noinline)) void render_screen_touchpad() {
         }
         char buf[20];
         snprintf(buf, sizeof(buf), "Fingers: %d", active);
-        draw_text(0, 46, buf);
+        draw_text(kContentX, 46, buf);
     } else {
-        draw_text(0, 30, "(no controller)");
+        draw_text(kContentX, 30, "(no controller)");
     }
-    draw_text(0, 56, "K0=next");
     flush_fb();
 }
 
@@ -803,9 +857,25 @@ const char* lb_mode_tag(int mode) {
     }
 }
 
+// R1 rising edge on Lightbar cycles lb_mode. Used to be KEY1; that moved
+// to back-nav. Triangle on this screen stays as "save current RGB to
+// favorite slot 0" (the existing favorite-save UX), so R1 is the next
+// free button that doesn't break a mental model.
+void lightbar_handle_input() {
+    if (!bt_is_connected()) { lb_last_buttons = 0; return; }
+    const uint8_t btns   = interrupt_in_data[8];
+    const bool r1_now    = (btns & 0x02) != 0;
+    const bool r1_prev   = (lb_last_buttons & 0x02) != 0;
+    if (r1_now && !r1_prev) {
+        lb_mode = (lb_mode + 1) % kNumLbModes;
+    }
+    lb_last_buttons = btns;
+}
+
 __attribute__((noinline)) void render_screen_lightbar() {
+    lightbar_handle_input();
     fb_clear();
-    draw_text(0, 0, "Lightbar");
+    draw_text(kContentX, 0, "Lightbar");
     draw_text(86, 0, lb_mode_tag(lb_mode));
 
     if (bt_is_connected()) {
@@ -853,14 +923,14 @@ __attribute__((noinline)) void render_screen_lightbar() {
         }
 
         char buf[16];
-        snprintf(buf, sizeof(buf), "R:%3u", lb_r); draw_text(0,  12, buf);
-        snprintf(buf, sizeof(buf), "G:%3u", lb_g); draw_text(44, 12, buf);
-        snprintf(buf, sizeof(buf), "B:%3u", lb_b); draw_text(88, 12, buf);
+        snprintf(buf, sizeof(buf), "R:%3u", lb_r); draw_text(kContentX, 12, buf);
+        snprintf(buf, sizeof(buf), "G:%3u", lb_g); draw_text(48, 12, buf);
+        snprintf(buf, sizeof(buf), "B:%3u", lb_b); draw_text(90, 12, buf);
 
         const int by = 22, bh = 8;
-        rect_outline(0,  by, 40, bh); int rf = (lb_r * 36) / 255; if (rf > 0) rect_filled(2,  by + 2, rf, bh - 4);
-        rect_outline(44, by, 40, bh); int gf = (lb_g * 36) / 255; if (gf > 0) rect_filled(46, by + 2, gf, bh - 4);
-        rect_outline(88, by, 40, bh); int bf = (lb_b * 36) / 255; if (bf > 0) rect_filled(90, by + 2, bf, bh - 4);
+        rect_outline(kContentX,  by, 38, bh); int rf = (lb_r * 34) / 255; if (rf > 0) rect_filled(kContentX + 2,  by + 2, rf, bh - 4);
+        rect_outline(48, by, 38, bh); int gf = (lb_g * 34) / 255; if (gf > 0) rect_filled(50, by + 2, gf, bh - 4);
+        rect_outline(90, by, 38, bh); int bf = (lb_b * 34) / 255; if (bf > 0) rect_filled(92, by + 2, bf, bh - 4);
 
         // Face button rising-edge -> save current color to slot 0..3
         const uint8_t face = interrupt_in_data[7] & 0xF0;
@@ -877,47 +947,46 @@ __attribute__((noinline)) void render_screen_lightbar() {
             lb_fav_b[save_slot] = lb_b;
         }
 
-        draw_text(0, 38, "Sv:T=0 C=1 X=2 S=3");
+        draw_text(kContentX, 38, "Sv:T=0 C=1 X=2 S=3");
         const char* hint =
             (lb_mode == 0) ? "Tilt = R/G/B" :
             (lb_mode == 5) ? "Breathing FAV0" :
             (lb_mode == 6) ? "Rainbow sweep" :
             (lb_mode == 7) ? "Fade thru FAVs" :
                              "Locked to fav";
-        draw_text(0, 48, hint);
+        draw_text(kContentX, 48, hint);
 
         send_lightbar_color(lb_r, lb_g, lb_b);
     } else {
-        draw_text(0, 30, "(no controller)");
+        draw_text(kContentX, 30, "(no controller)");
     }
-    draw_text(0, 56, "K0=next K1=cycle");
+    draw_text(kContentX, 56, "R1=mode");
     flush_fb();
 }
 
 __attribute__((noinline)) void render_screen_vu() {
     fb_clear();
-    draw_text(0, 0, "Audio Meters");
+    draw_text(kContentX, 0, "Audio Meters");
     if (bt_is_connected()) {
         const uint8_t spk = audio_peak_speaker();
         const uint8_t hap = audio_peak_haptic();
         char buf[16];
         snprintf(buf, sizeof(buf), "SPK %3u", spk);
-        draw_text(0, 14, buf);
+        draw_text(kContentX, 14, buf);
         rect_outline(48, 14, 80, 8);
         int sfill = (spk * 76) / 255;
         if (sfill > 0) rect_filled(50, 16, sfill, 4);
 
         snprintf(buf, sizeof(buf), "HAP %3u", hap);
-        draw_text(0, 28, buf);
+        draw_text(kContentX, 28, buf);
         rect_outline(48, 28, 80, 8);
         int hfill = (hap * 76) / 255;
         if (hfill > 0) rect_filled(50, 30, hfill, 4);
 
-        draw_text(0, 42, "Live USB audio peaks");
+        draw_text(kContentX, 42, "Live USB audio peaks");
     } else {
-        draw_text(0, 30, "(no controller)");
+        draw_text(kContentX, 30, "(no controller)");
     }
-    draw_text(0, 56, "K0=next");
     flush_fb();
 }
 
@@ -1088,7 +1157,7 @@ __attribute__((noinline)) void render_screen_settings() {
     fb_clear();
     char buf[24];
     snprintf(buf, sizeof(buf), "Settings %s", settings_dirty ? "(*)" : "   ");
-    draw_text(0, 0, buf);
+    draw_text(kContentX, 0, buf);
     if (settings_save_status[0]) {
         draw_text(86, 0, settings_save_status);
     }
@@ -1099,15 +1168,15 @@ __attribute__((noinline)) void render_screen_settings() {
     char line[28];
     for (int i = 0; i < kVisible && top + i < kNumSettingsItems; i++) {
         format_settings_item(top + i, line, sizeof(line));
-        draw_text(0, 9 + i * 9, line);
+        draw_text(kContentX, 9 + i * 9, line);
     }
 
     if (settings_sel == kSettingsResetIdx) {
-        draw_text(0, 56, "Hold Tri 2s = RESET");
+        draw_text(kContentX, 56, "Hold Tri 2s = RESET");
     } else if (settings_sel == kSettingsWipeSlotsIdx) {
-        draw_text(0, 56, "Hold Tri 2s = WIPE");
+        draw_text(kContentX, 56, "Hold Tri 2s = WIPE");
     } else {
-        draw_text(0, 56, "DP nav/adj  Tri=save");
+        draw_text(kContentX, 56, "DP nav/adj  Tri=save");
     }
     flush_fb();
 }
@@ -1183,7 +1252,7 @@ __attribute__((noinline)) void render_screen_slots() {
     const int active = bt_get_slot();
     const bool conn = bt_is_connected();
     snprintf(hdr, sizeof(hdr), "Slots         [s%d %s]", active, conn ? "ON" : "--");
-    draw_text(0, 0, hdr);
+    draw_text(kContentX, 0, hdr);
 
     if (slots_status[0] && (uint32_t)time_us_32() < slots_status_until_us) {
         draw_text(80, 0, slots_status);
@@ -1201,10 +1270,10 @@ __attribute__((noinline)) void render_screen_slots() {
         } else {
             snprintf(line, sizeof(line), "%s%d%s (empty)", cursor_mark, i, active_mark);
         }
-        draw_text(0, 9 + i * 9, line);
+        draw_text(kContentX, 9 + i * 9, line);
     }
 
-    draw_text(0, 56, "Tri=switch Sq hold=wipe");
+    draw_text(kContentX, 56, "Tri=switch Sq hold=wipe");
     flush_fb();
 }
 
