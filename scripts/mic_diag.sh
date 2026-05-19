@@ -173,7 +173,8 @@ def query():
     buf = bytearray(32); buf[0] = 0xFD
     ioctl_num_32 = (3 << 30) | (32 << 16) | (ord('H') << 8) | 0x07
     fcntl.ioctl(f, ioctl_num_32, buf)
-    return bytes(buf)
+    # Kernel prepends the report ID at byte 0; firmware payload starts at byte 1.
+    return bytes(buf[1:])
 
 def decode(b):
     bt31    = struct.unpack('<I', b[0:4])[0]
