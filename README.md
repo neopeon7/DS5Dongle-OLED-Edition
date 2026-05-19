@@ -6,6 +6,26 @@
 
 > **OLED Edition** is a fork of **[awalol/DS5Dongle](https://github.com/awalol/DS5Dongle)** (upstream) that adds an optional Pico-OLED-1.3 128×64 display add-on with 11 screens (status, 4-slot multi-controller pairing, lightbar color picker with favorites and effect presets, trigger test, gyro tilt, touchpad, diagnostics, CPU/clock, BT signal strength, audio VU meters, and a persistent settings menu), plus a DS5 button-combo soft-reboot. Upstream is the authoritative source for the core bridge firmware; this fork tracks it and layers add-on features on top.
 
+---
+
+## 🛠️ Web Config Tool
+
+**[→ Open the OLED Edition Web Config](https://marcelinevpq.github.io/DS5Dongle-OLED-Config-Web/#config)**
+
+The web tool is a one-stop shop — **no installs, no command line, no `picotool`**. A brand-new Pico 2 W can go from "just out of the box" to fully flashed and configured without ever leaving the browser:
+
+- **Flash Firmware tab** — put the Pico in **BOOTSEL mode**, then click *Connect to Pico* in the browser and *Flash now*. The site bundles the latest release UF2, or you can load a local `.uf2` you've built yourself. Powered by WebUSB.
+
+  > **What is BOOTSEL mode?** It's the Pico's built-in flashing mode. To enter it: press and hold the small white button labeled **BOOTSEL** on the Pico, *then* plug the USB cable in (or, if it's already plugged in, briefly disconnect and reconnect while holding BOOTSEL). The Pico will appear to your computer as a removable drive — that's how you know it's in BOOTSEL mode. After the web tool flashes the firmware, the Pico auto-reboots into normal mode and is ready to use.
+- **Config tab** — once the dongle is flashed and reconnected, edit haptics gain, speaker volume, polling rate, audio auto-haptics mode, and the rest of the persistent settings; save to the dongle's flash with one click. Powered by WebHID.
+- **OLED Preview tab** — pixel-perfect emulation of all 11 OLED screens. Use the in-page KEY0/KEY1 buttons (or the controller's △ / R1 / D-pad when a DualSense is paired) to navigate. Adaptive triggers actually fire on the controller when you cycle the Trigger Test preset.
+
+Works in any Chromium-based browser (Chrome, Edge, Brave, Opera). Firefox + Safari don't expose WebHID or WebUSB, so flashing and live config aren't available there — the OLED Preview still renders with mock data.
+
+> Source for the web tool: **[MarcelineVPQ/DS5Dongle-OLED-Config-Web](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Config-Web)** (fork of [awalol/ds5dongle-config-web](https://github.com/awalol/ds5dongle-config-web)).
+
+---
+
 ## Overview
 
 This project enables the Raspberry Pi Pico2W to function as a Bluetooth bridge for the DualSense controller, allowing wireless connectivity with enhanced haptics support.
@@ -127,16 +147,18 @@ To opt out at build time, configure with `-DENABLE_BATT_LED=OFF`. Default is ON.
 
 ## Performance / Overclocking
 
-Due to encoding requirements, the Pico2W must be overclocked:
+**You don't need to do anything for this — the overclock is baked into the firmware.** When you flash a UF2 from this repo, the Pico 2 W boots at the settings below automatically. There is no separate tool to run, no config file to edit, no fuses to blow.
 
-Current settings:
+Baked-in settings:
 
-- Voltage: 1.2V
-- Frequency: 320 MHz
+- **Voltage: 1.20 V** (`vreg_set_voltage(VREG_VOLTAGE_1_20)`)
+- **Clock: 320 MHz** (`set_sys_clock_khz(SYS_CLOCK_KHZ, true)`)
 
-If your device fails to boot:
+Why it's required: at stock clock/voltage the CYW43 PIO SPI bus (the path the firmware uses to talk to the on-board Bluetooth chip) is unreliable and pairing fails. 320 MHz @ 1.20 V is the lowest combination we've verified to produce a stable BT link on this board.
 
-- Increase voltage slightly or Reduce CPU frequency
+If your device fails to boot a build you compiled yourself (unusual — only relevant when you've changed source), try increasing voltage slightly or lowering the clock in `src/main.cpp`. End users running official UF2 releases should not need to touch this.
+
+A small heatsink on the RP2350 is **recommended for sustained gameplay** but not required for pairing or short sessions.
 
 ## Build Instructions
 
