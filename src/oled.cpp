@@ -535,11 +535,19 @@ void handle_buttons() {
 // step's taper weight); the remaining steps are then re-weighted. This makes
 // the estimate consistent whether the user plugged in near-empty or near-full.
 struct ChargeEta {
-    bool charging;  // pstate == 1 (so the token shows only while charging)
-    bool valid;     // at least one full step timed → minutes is meaningful
-    int  minutes;   // estimated minutes to 100%
+    bool charging;    // pstate == 1 (so the token shows only while charging)
+    bool valid;       // minutes is meaningful (provisional or measured)
+    bool provisional; // true until a full step is timed — using the default rate
+    int  minutes;     // estimated minutes to 100%
 };
 ChargeEta g_charge_eta{};
+
+// Default bulk-step duration used for a provisional estimate before any real
+// step has been timed, so the token shows "~Nm?" immediately on plug-in instead
+// of sitting on "~--m" for ~15-20 min. Tuned to an observed ~15 min per 10% on
+// this dongle's charge current; it self-corrects to the measured rate (and drops
+// the "?") as soon as the first clean step completes.
+constexpr float kDefaultStepUs = 15.0f * 60.0f * 1000000.0f;
 
 // Relative time the step *ending* at `to_level` (10% units, 1..10) takes vs a
 // bulk step. Tuned to the Li-ion CV taper: ~80% onward stretches out.
@@ -605,20 +613,30 @@ void sample_charge_eta() {
     }
 
     g_charge_eta.charging = true;
-    if (ring_count > 0 && cur_step < 10) {
-        float bulk = 0.0f;
-        for (int i = 0; i < ring_count; i++) bulk += ring[i];
-        bulk /= (float)ring_count;
+    if (cur_step < 10) {
+        // Use the measured rate once we have a timed step; until then fall back
+        // to the default rate and flag the estimate provisional (renders "?").
+        const bool measured = (ring_count > 0);
+        float bulk;
+        if (measured) {
+            bulk = 0.0f;
+            for (int i = 0; i < ring_count; i++) bulk += ring[i];
+            bulk /= (float)ring_count;
+        } else {
+            bulk = kDefaultStepUs;
+        }
         float rem_us = 0.0f;
         for (int L = cur_step + 1; L <= 10; L++) rem_us += bulk * charge_step_weight(L);
         int mins = (int)(rem_us / 60000000.0f + 0.5f);
         if (mins < 0)   mins = 0;
         if (mins > 999) mins = 999;
         g_charge_eta.valid = true;
+        g_charge_eta.provisional = !measured;
         g_charge_eta.minutes = mins;
     } else {
         // cur_step == 10 → essentially full; nothing meaningful to count down.
-        g_charge_eta.valid = (cur_step >= 10);
+        g_charge_eta.valid = true;
+        g_charge_eta.provisional = false;
         g_charge_eta.minutes = 0;
     }
 }
@@ -655,13 +673,15 @@ __attribute__((noinline)) void render_screen() {
         draw_text(kContentX, 18, bbuf);
         draw_battery_icon(36, 18, pct);
 
-        // Charge ETA, right of the battery icon (icon ends at x≈90). Shown
-        // only while charging: "~43m" once a step has been timed, "~--m" while
-        // still calibrating the first step. See sample_charge_eta().
+        // Charge ETA, right of the battery icon (icon ends at x≈90). Shown only
+        // while charging: "~43m?" is the provisional default-rate estimate shown
+        // immediately on plug-in; the "?" drops to "~43m" once a real 10% step
+        // has been timed and the measured rate takes over. See sample_charge_eta().
         if (g_charge_eta.charging) {
             char ebuf[8];
             if (g_charge_eta.valid)
-                snprintf(ebuf, sizeof(ebuf), "~%dm", g_charge_eta.minutes);
+                snprintf(ebuf, sizeof(ebuf), "~%dm%s", g_charge_eta.minutes,
+                         g_charge_eta.provisional ? "?" : "");
             else
                 snprintf(ebuf, sizeof(ebuf), "~--m");
             draw_text(94, 18, ebuf);
