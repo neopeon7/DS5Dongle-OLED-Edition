@@ -23,6 +23,7 @@ extern uint32_t bt_31_packet_count();
 extern uint32_t host_out02_total();
 extern uint32_t host_out02_trig_allow();
 extern uint32_t host_out02_to_bt();
+extern uint32_t host_out02_trig_folded();
 extern uint8_t  bt_31_last_byte2();
 extern uint8_t  bt_31_b2_or_mask();
 extern uint16_t bt_31_len_min();
@@ -83,16 +84,18 @@ uint8_t current_contrast = 0xFF;
 
 // Auto-dim / auto-off after idle. Tracks last button/input activity.
 // Tier 1: Active → full brightness (bright_idx).
-// Tier 2: idle > kAutoDimUs → contrast drops to kDimContrast (deep dim).
-// Tier 3: idle > kAutoOffUs → SH1107 panel turned fully off (cmd 0xAE)
+// Tier 2: idle > dim threshold → contrast drops to kDimContrast (deep dim).
+// Tier 3: idle > off threshold → SH1107 panel turned fully off (cmd 0xAE)
 //         to prevent OLED burn-in on long unattended sits.
+// The two thresholds are user-configurable (Config_body.screen_dim_timeout /
+// screen_off_timeout, minutes; 0 = tier disabled) — issue #5. last_activity_us
+// is 64-bit µs so the full 0..250 min range is representable without the ~71 min
+// wrap of time_us_32().
 // kDimContrast tuned by eye: 0x10 looked like only ~10% reduction on this
 // panel (contrast-vs-brightness is heavily non-linear near the bottom of
 // the register range). 0x02 is visibly dim while still legible up close.
-uint32_t last_activity_us = 0;
+uint64_t last_activity_us = 0;
 uint32_t last_input_hash = 0;
-constexpr uint32_t kAutoDimUs = 2UL * 60UL * 1000000UL;  // 2 min — generous for pairing
-constexpr uint32_t kAutoOffUs = 15UL * 60UL * 1000000UL; // 15 min
 constexpr uint8_t kDimContrast = 0x01;
 enum OledPowerState { OLED_ACTIVE, OLED_DIM, OLED_OFF };
 OledPowerState oled_power_state = OLED_ACTIVE;
@@ -123,12 +126,14 @@ constexpr int kLbModeHost = 8;
 constexpr int kNumLbModes = 9;
 
 // Settings screen state
-constexpr int kNumSettingsItems = 13; // 8 fields + 3 auto-haptic + Reset + Wipe
+constexpr int kNumSettingsItems = 15; // 8 fields + 3 auto-haptic + 2 screen-timeout + Reset + Wipe
 constexpr int kSettingsAutoHapEnaIdx  = 8;
 constexpr int kSettingsAutoHapGainIdx = 9;
 constexpr int kSettingsAutoHapLpIdx   = 10;
-constexpr int kSettingsResetIdx       = 11;
-constexpr int kSettingsWipeSlotsIdx   = 12;
+constexpr int kSettingsScrDimIdx      = 11;
+constexpr int kSettingsScrOffIdx      = 12;
+constexpr int kSettingsResetIdx       = 13;
+constexpr int kSettingsWipeSlotsIdx   = 14;
 Config_body settings_local{};
 int settings_sel = 0;
 bool settings_dirty = false;
@@ -479,13 +484,13 @@ void handle_buttons() {
     if (!k0 && key0_prev && (now - key0_t_us) > kDebounceUs) {
         key0_t_us = now;
         key0_armed = true;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
     }
     if (k0 && !key0_prev && key0_armed) {
         key0_armed = false;
         current_screen = (current_screen + 1) % kNumScreens;
         last_render_us = 0;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
     }
 
     // KEY1: arm on press, fire on release. Short press = back; long press
@@ -497,12 +502,12 @@ void handle_buttons() {
         key1_t_us = now;
         key1_press_us = now;
         key1_was_pressed = true;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
     }
     if (k1 && !key1_prev && key1_was_pressed) {
         key1_was_pressed = false;
         const uint32_t held = now - key1_press_us;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
         if (held > kLongPressUs) {
             bright_idx = (bright_idx + 1) % kNumBrightLevels;
         } else {
@@ -801,7 +806,7 @@ void sample_diag_rates() {
 
 // Row list ordered by relevance: always-useful at top, parked-mic-investigation
 // data at bottom. To add a row, bump kNumDiagRows and add a case.
-constexpr int kNumDiagRows = 10;
+constexpr int kNumDiagRows = 11;
 __attribute__((noinline))
 void format_diag_row(int idx, char* line, size_t n) {
     switch (idx) {
@@ -825,23 +830,28 @@ void format_diag_row(int idx, char* line, size_t n) {
                      (unsigned long)host_out02_to_bt());
             break;
         case 4:
-            snprintf(line, n, "BT31 in: %lu/s", (unsigned long)g_diag_rates.bt31_rate);
+            // Trigger reports folded into the 0x36 audio path (speaker active),
+            // not sent as 0x31. trig == tx-trig-share + this → no drops (#6).
+            snprintf(line, n, "trig fold: %lu", (unsigned long)host_out02_trig_folded());
             break;
         case 5:
-            snprintf(line, n, "USB aud: %lu/s", (unsigned long)g_diag_rates.usb_rate);
+            snprintf(line, n, "BT31 in: %lu/s", (unsigned long)g_diag_rates.bt31_rate);
             break;
         case 6:
-            snprintf(line, n, "BT32 out: %lu/s", (unsigned long)g_diag_rates.bt_rate);
+            snprintf(line, n, "USB aud: %lu/s", (unsigned long)g_diag_rates.usb_rate);
             break;
         case 7:
-            snprintf(line, n, "Mic in: %lu/s", (unsigned long)g_diag_rates.mic_rate);
+            snprintf(line, n, "BT32 out: %lu/s", (unsigned long)g_diag_rates.bt_rate);
             break;
         case 8:
+            snprintf(line, n, "Mic in: %lu/s", (unsigned long)g_diag_rates.mic_rate);
+            break;
+        case 9:
             snprintf(line, n, "Mic dec=%ld w=%u",
                      (long)audio_mic_last_decoded(),
                      (unsigned)audio_mic_last_wrote());
             break;
-        case 9: {
+        case 10: {
             uint8_t pfx[6]; bt_31_mic_prefix(pfx);
             snprintf(line, n, "%02X %02X %02X %02X %02X %02X",
                      pfx[0], pfx[1], pfx[2], pfx[3], pfx[4], pfx[5]);
@@ -1374,6 +1384,18 @@ void settings_adjust(int delta) {
             c.auto_haptics_lowpass = (uint8_t)v;
             break;
         }
+        case 11: { // screen_dim_timeout  [0,250] min, 0 = disabled
+            int v = (int)c.screen_dim_timeout + delta;
+            if (v < 0) v = 0; if (v > 250) v = 250;
+            c.screen_dim_timeout = (uint8_t)v;
+            break;
+        }
+        case 12: { // screen_off_timeout  [0,250] min, 0 = disabled
+            int v = (int)c.screen_off_timeout + delta;
+            if (v < 0) v = 0; if (v > 250) v = 250;
+            c.screen_off_timeout = (uint8_t)v;
+            break;
+        }
     }
 }
 
@@ -1467,8 +1489,16 @@ __attribute__((noinline)) void format_settings_item(int idx, char* line, size_t 
             snprintf(line, n, "%s AH LP %s", cur, names[c.auto_haptics_lowpass & 3]);
             break;
         }
-        case 11: snprintf(line, n, "%s Reset to defaults", cur); break;
-        case 12: snprintf(line, n, "%s Wipe all slots", cur); break;
+        case 11:
+            if (c.screen_dim_timeout == 0) snprintf(line, n, "%s ScrDim off", cur);
+            else snprintf(line, n, "%s ScrDim %umin", cur, c.screen_dim_timeout);
+            break;
+        case 12:
+            if (c.screen_off_timeout == 0) snprintf(line, n, "%s ScrOff off", cur);
+            else snprintf(line, n, "%s ScrOff %umin", cur, c.screen_off_timeout);
+            break;
+        case 13: snprintf(line, n, "%s Reset to defaults", cur); break;
+        case 14: snprintf(line, n, "%s Wipe all slots", cur); break;
     }
 }
 
@@ -1700,22 +1730,27 @@ void oled_loop() {
     }
     if (hash != last_input_hash) {
         last_input_hash = hash;
-        last_activity_us = now;
+        last_activity_us = time_us_64();
     }
     // Rising-edge: BT-connect itself counts as activity, so the screen wakes
     // the moment a controller pairs rather than waiting for the first input.
     const bool bt_connected_now = bt_is_connected();
-    if (bt_connected_now && !prev_bt_connected) last_activity_us = now;
+    if (bt_connected_now && !prev_bt_connected) last_activity_us = time_us_64();
     prev_bt_connected = bt_connected_now;
 
     // Power-state ladder: Active → Dim (breathing dot) → Off based on idle time.
+    // Thresholds are user-configurable (minutes; 0 = that tier disabled) — #5.
     // While charging we cap the ladder at Dim — the panel keeps doing the
     // low-power breathing dot but never fully sleeps. This stops the user from
     // unplugging the controller just to "wake" the dongle (which would reset the
     // charge-ETA calibration). The dot tier already draws ~no current, so this
     // costs little; sample_charge_eta() runs before this block regardless.
-    const uint32_t idle = now - last_activity_us;
-    if (idle > kAutoOffUs && !g_charge_eta.charging) {
+    const uint64_t idle   = time_us_64() - last_activity_us;
+    const uint64_t dim_us = (uint64_t)get_config().screen_dim_timeout * 60ULL * 1000000ULL;
+    const uint64_t off_us = (uint64_t)get_config().screen_off_timeout * 60ULL * 1000000ULL;
+    const bool off_enabled = get_config().screen_off_timeout != 0;
+    const bool dim_enabled = get_config().screen_dim_timeout != 0;
+    if (off_enabled && idle > off_us && !g_charge_eta.charging) {
         if (oled_power_state != OLED_OFF) {
             cmd(0xAE);
             oled_power_state = OLED_OFF;
@@ -1723,10 +1758,10 @@ void oled_loop() {
         return; // panel is off, nothing to draw
     }
     if (oled_power_state == OLED_OFF) cmd(0xAF); // wake panel before drawing
-    if (idle > kAutoDimUs) {
+    if (dim_enabled && idle > dim_us) {
         sh1107_set_contrast(kDimContrast);
         oled_power_state = OLED_DIM;
-        render_dim_pulse(idle - kAutoDimUs);
+        render_dim_pulse((uint32_t)(idle - dim_us));
         return; // skip the regular per-screen render path
     }
     sh1107_set_contrast(kBrightLevels[bright_idx]);

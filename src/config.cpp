@@ -101,6 +101,14 @@ void config_valid() {
     }
     // lb_fav_{r,g,b} need no validation — any 0..255 is a legal color, and an
     // erased flash sector (0xFF) yields 4 white favorites, a usable default.
+    if (body->screen_dim_timeout > 250) { // 0xFF erased / out of range → default
+        body->screen_dim_timeout = 2;     // mirrors the original 2-min dim tier
+        printf("[Config] screen_dim_timeout invalid, defaulting to 2 min\n");
+    }
+    if (body->screen_off_timeout > 250) {
+        body->screen_off_timeout = 15;    // mirrors the original 15-min off tier
+        printf("[Config] screen_off_timeout invalid, defaulting to 15 min\n");
+    }
     if (body->config_version != CONFIG_VERSION) {
         body->config_version = CONFIG_VERSION;
         printf("[Config] Warning: Config may breaking change\n");

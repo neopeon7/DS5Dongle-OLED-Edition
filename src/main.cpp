@@ -66,13 +66,21 @@ void bt_31_mic_prefix(uint8_t out[6]) {
 //   out02_to_bt     - 0x02 reports that we forwarded to the controller as
 //                     a BT 0x31 sub-0x10 packet (gated off when speaker is
 //                     active; audio.cpp's 0x36 path carries state then)
+//   out02_trig_folded - of the trig_allow reports, how many arrived while the
+//                     speaker stream was active and were therefore NOT sent as
+//                     a standalone 0x31 — their trigger FFB was folded into the
+//                     0x36 audio frames via state[]. So trig_allow == to_bt's
+//                     trigger share + this, proving the "missing" forwards
+//                     (issue #6) aren't drops. Surfaced on the Diag screen.
 // Surfaced on the OLED Diagnostics screen.
 volatile uint32_t g_host_out02_total = 0;
 volatile uint32_t g_host_out02_trig_allow = 0;
 volatile uint32_t g_host_out02_to_bt = 0;
-uint32_t host_out02_total()      { return g_host_out02_total; }
-uint32_t host_out02_trig_allow() { return g_host_out02_trig_allow; }
-uint32_t host_out02_to_bt()      { return g_host_out02_to_bt; }
+volatile uint32_t g_host_out02_trig_folded = 0;
+uint32_t host_out02_total()       { return g_host_out02_total; }
+uint32_t host_out02_trig_allow()  { return g_host_out02_trig_allow; }
+uint32_t host_out02_to_bt()       { return g_host_out02_to_bt; }
+uint32_t host_out02_trig_folded() { return g_host_out02_trig_folded; }
 
 uint8_t interrupt_in_data[63] = {
     0x7f, 0x7d, 0x7f, 0x7e, 0x00, 0x00, 0xa7,
@@ -274,6 +282,11 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
                 }
                 state_update(buffer + 1, bufsize - 1);
                 if (spk_active) {
+                    // Not forwarded as a standalone 0x31 — the trigger FFB just
+                    // written into state[] rides the 0x36 audio frames instead.
+                    // Count the trigger-bearing ones so the Diag screen shows
+                    // trig_allow == to_bt(trig) + folded (issue #6: not drops).
+                    if (bufsize > 1 && (buffer[1] & 0x0C)) g_host_out02_trig_folded++;
                     break;
                 }
                 uint8_t outputData[78]{};

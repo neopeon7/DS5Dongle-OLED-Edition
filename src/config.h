@@ -33,6 +33,12 @@ struct __attribute__((packed)) Config_body {
     uint8_t lb_fav_r[4];
     uint8_t lb_fav_g[4];
     uint8_t lb_fav_b[4];
+    // OLED idle power-ladder thresholds, in minutes. 0 = that tier disabled.
+    // Defaults preserve the original hardcoded ladder (2 min dim, 15 min off).
+    // Range [0,250] (0xFF erased flash → default via config_valid clamp). The
+    // idle timer is 64-bit µs so the full range is representable. Issue #5.
+    uint8_t screen_dim_timeout;
+    uint8_t screen_off_timeout;
 };
 
 struct __attribute__((packed)) Config {
