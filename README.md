@@ -265,7 +265,7 @@ Every screen also paints **`>`** at the top-left edge (next to KEY0) and **`<`**
 
 #### 1. Status
 
-Connection state, paired DualSense BD address, battery % with bar (`+` charging / `*` complete / `!` error), live analog stick positions, D-pad, face buttons (△ ◯ ✕ □), L1/R1, and L2/R2 analog trigger fill bars. The link indicator and battery use small pixel icons.
+Connection state, paired DualSense BD address, battery % with bar (`+` charging / `*` complete / `!` error), live analog stick positions (each stick box flashes inverse — a black dot on a white box — while its **L3 / R3** is clicked in), D-pad, face buttons (△ ◯ ✕ □), L1/R1, and L2/R2 analog trigger fill bars. The link indicator and battery use small pixel icons. While charging, a `~Nm` estimate of the time to 100% appears next to the battery.
 
 <img src="./assets/oled/oled_sc01.jpg" alt="Status screen on the OLED" width="420">
 
@@ -300,7 +300,7 @@ Cycle order: **Off → Feedback → Weapon → Vibration → Bow → Gallop → 
 
 #### 5. Gyro Tilt
 
-Live X/Y/Z accelerometer values with a 40×40 crosshair box. Tilt the controller and the dot tracks in real time.
+Live X/Y/Z accelerometer values with a 40×40 crosshair box. The dot tracks the controller's tilt in real time and **sits centered when the controller lies flat** — it's driven by the controller's own per-unit factory IMU calibration (parsed from feature report `0x05`), so the rest position and gain are correct on every controller. Tilting left/right and forward/back moves the dot in the matching direction.
 
 <img src="./assets/oled/oled_sc05.jpg" alt="Gyro Tilt screen on the OLED" width="420">
 
